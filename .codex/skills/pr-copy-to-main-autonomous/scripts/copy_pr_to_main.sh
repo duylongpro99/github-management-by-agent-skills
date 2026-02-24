@@ -7,18 +7,14 @@ Usage:
   copy_pr_to_main.sh --repo owner/repo --pr 1686 [options]
 
 Options:
-  --repo <owner/repo>            Required repository slug
+  --repo <owner/repo>            Repository slug (or set GITHUB_ORG + GITHUB_REPO in .env)
   --pr <number>                  Required source PR number
   --target-branch <branch>       Target branch for new branch checkout (default: repo default branch)
   --source-base-branch <branch>  Optional override for PR source base branch used to compute exact PR diff
   --branch-prefix <prefix>       Branch prefix (default: copy-pr)
-  --ssh-host <host>              SSH host alias (default: github.com)
-  --api-host <host>              API host (default: api.github.com)
-  --web-host <host>              Web host (default: github.com)
-  --token-env <envvar>           Token env var for API (default: GITHUB_PERSONAL_ACCESS_TOKEN)
   --title <title>                PR title override
   --body <body>                  PR body override
-  --create-pr                    Create PR via GitHub REST API after push
+  --create-pr                    Create PR via gh CLI after push
   --keep-workdir                 Keep /tmp working directory
   -h, --help                     Show help
 USAGE
@@ -32,56 +28,21 @@ need_cmd() {
 }
 
 detect_pr_base_branch() {
-  local api_host="$1"
-  local repo="$2"
-  local pr_number="$3"
-  local token_env="$4"
-  local token=""
-  local response=""
+  local repo="$1"
+  local pr_number="$2"
   local base_ref=""
-
-  token="${!token_env:-}"
-
-  if [[ -n "$token" ]]; then
-    response="$(curl -sS \
-      -H "Authorization: Bearer ${token}" \
-      -H "Accept: application/vnd.github+json" \
-      "https://${api_host}/repos/${repo}/pulls/${pr_number}" || true)"
-  else
-    response="$(curl -sS \
-      -H "Accept: application/vnd.github+json" \
-      "https://${api_host}/repos/${repo}/pulls/${pr_number}" || true)"
-  fi
-
-  base_ref="$(printf '%s' "$response" | jq -r '.base.ref // empty' 2>/dev/null || true)"
-
-  if [[ -n "$base_ref" ]]; then
-    echo "$base_ref"
-    return 0
-  fi
-
+  base_ref="$(gh pr view "${pr_number}" --repo "${repo}" \
+    --json baseRefName --jq '.baseRefName' 2>/dev/null || true)"
+  [[ -n "$base_ref" ]] && { echo "$base_ref"; return 0; }
   return 1
 }
 
 detect_repo_default_branch() {
-  local ref=""
+  local repo="$1"
   local branch=""
-
-  ref="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-  if [[ -n "$ref" ]]; then
-    branch="${ref#origin/}"
-    if [[ -n "$branch" ]]; then
-      echo "$branch"
-      return 0
-    fi
-  fi
-
-  branch="$(git remote show origin 2>/dev/null | awk '/HEAD branch/ {print $NF}' | head -n 1 || true)"
-  if [[ -n "$branch" ]]; then
-    echo "$branch"
-    return 0
-  fi
-
+  branch="$(gh repo view "${repo}" \
+    --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)"
+  [[ -n "$branch" ]] && { echo "$branch"; return 0; }
   return 1
 }
 
@@ -95,14 +56,18 @@ PR_NUMBER=""
 TARGET_BRANCH=""
 SOURCE_BASE_BRANCH=""
 BRANCH_PREFIX="copy-pr"
-SSH_HOST="github.com"
-API_HOST="api.github.com"
-WEB_HOST="github.com"
-TOKEN_ENV="GITHUB_PERSONAL_ACCESS_TOKEN"
 PR_TITLE=""
 PR_BODY=""
 CREATE_PR=0
 KEEP_WORKDIR=0
+
+# --- Load .env from repo root (4 levels above this script's directory) ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+if [[ -f "${REPO_ROOT}/.env" ]]; then
+  # shellcheck source=/dev/null
+  set -o allexport; source "${REPO_ROOT}/.env"; set +o allexport
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -111,10 +76,6 @@ while [[ $# -gt 0 ]]; do
     --target-branch) TARGET_BRANCH="${2:-}"; shift 2 ;;
     --source-base-branch) SOURCE_BASE_BRANCH="${2:-}"; shift 2 ;;
     --branch-prefix) BRANCH_PREFIX="${2:-}"; shift 2 ;;
-    --ssh-host) SSH_HOST="${2:-}"; shift 2 ;;
-    --api-host) API_HOST="${2:-}"; shift 2 ;;
-    --web-host) WEB_HOST="${2:-}"; shift 2 ;;
-    --token-env) TOKEN_ENV="${2:-}"; shift 2 ;;
     --title) PR_TITLE="${2:-}"; shift 2 ;;
     --body) PR_BODY="${2:-}"; shift 2 ;;
     --create-pr) CREATE_PR=1; shift ;;
@@ -124,6 +85,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# --- Env var fallback for --repo ---
+if [[ -z "$REPO" && -n "${GITHUB_ORG:-}" && -n "${GITHUB_REPO:-}" ]]; then
+  REPO="${GITHUB_ORG}/${GITHUB_REPO}"
+  echo "[info] repo resolved from .env: ${REPO}"
+fi
+
 if [[ -z "$REPO" || -z "$PR_NUMBER" ]]; then
   echo "--repo and --pr are required." >&2
   usage
@@ -131,8 +98,7 @@ if [[ -z "$REPO" || -z "$PR_NUMBER" ]]; then
 fi
 
 need_cmd git
-need_cmd curl
-need_cmd jq
+need_cmd gh
 
 if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "PR number must be numeric." >&2
@@ -147,11 +113,11 @@ if [[ "$KEEP_WORKDIR" -eq 0 ]]; then
   trap 'rm -rf "$WORKDIR"' EXIT
 fi
 
-git clone --quiet "git@${SSH_HOST}:${REPO}.git" "$WORKDIR"
+gh repo clone "${REPO}" "${WORKDIR}" -- --quiet
 cd "$WORKDIR"
 
 if [[ -z "$TARGET_BRANCH" ]]; then
-  if TARGET_BRANCH="$(detect_repo_default_branch)"; then
+  if TARGET_BRANCH="$(detect_repo_default_branch "$REPO")"; then
     echo "[info] Auto-detected target_branch=${TARGET_BRANCH} from repository default branch"
   else
     echo "[error] Could not auto-detect repository default branch. Pass --target-branch explicitly." >&2
@@ -175,12 +141,12 @@ if [[ "$PR_HEAD_PARENT_COUNT" -eq 1 ]]; then
   DIFF_STRATEGY="single-commit-cherry-pick"
 else
   if [[ -z "$SOURCE_BASE_BRANCH" ]]; then
-    if DETECTED_BASE_BRANCH="$(detect_pr_base_branch "$API_HOST" "$REPO" "$PR_NUMBER" "$TOKEN_ENV")"; then
+    if DETECTED_BASE_BRANCH="$(detect_pr_base_branch "$REPO" "$PR_NUMBER")"; then
       SOURCE_BASE_BRANCH="$DETECTED_BASE_BRANCH"
       echo "[info] Auto-detected source_base_branch=${SOURCE_BASE_BRANCH} from PR metadata"
     else
       echo "[error] Could not auto-detect PR base branch from PR metadata." >&2
-      echo "[error] Reason: missing API access/token, PR not found, or API host mismatch." >&2
+      echo "[error] Reason: gh CLI not authenticated, PR not found, or repository not accessible." >&2
       exit 1
     fi
   fi
@@ -253,15 +219,9 @@ git push -u origin "$NEW_BRANCH" --quiet
 
 echo "[ok] Pushed branch: $NEW_BRANCH"
 
-echo "[info] Open PR URL: https://${WEB_HOST}/${REPO}/pull/new/${NEW_BRANCH}"
+echo "[info] Open PR URL: https://github.com/${REPO}/pull/new/${NEW_BRANCH}"
 
 if [[ "$CREATE_PR" -eq 1 ]]; then
-  TOKEN="${!TOKEN_ENV:-}"
-  if [[ -z "$TOKEN" ]]; then
-    echo "[warn] ${TOKEN_ENV} is empty. Skipping API PR creation."
-    exit 0
-  fi
-
   [[ -z "$PR_TITLE" ]] && PR_TITLE="Copy PR #${PR_NUMBER} changes to ${TARGET_BRANCH}"
   if [[ -z "$PR_BODY" ]]; then
     if [[ "$USE_CHERRY_PICK" -eq 1 ]]; then
@@ -271,23 +231,14 @@ if [[ "$CREATE_PR" -eq 1 ]]; then
     fi
   fi
 
-  PAYLOAD="$(jq -n \
-    --arg title "$PR_TITLE" \
-    --arg head "$NEW_BRANCH" \
-    --arg base "$TARGET_BRANCH" \
-    --arg body "$PR_BODY" \
-    '{title:$title, head:$head, base:$base, body:$body}')"
-
-  HTTP_CODE="$(curl -s -o /tmp/create_pr_resp.json -w "%{http_code}" \
-    -H "Authorization: Bearer ${TOKEN}" \
-    -H "Accept: application/vnd.github+json" \
-    -X POST "https://${API_HOST}/repos/${REPO}/pulls" \
-    -d "$PAYLOAD")"
-
-  if [[ "$HTTP_CODE" == "201" ]]; then
-    echo "[ok] PR created: $(jq -r '.html_url' /tmp/create_pr_resp.json)"
+  if PR_URL="$(gh pr create \
+    --repo "${REPO}" \
+    --title "${PR_TITLE}" \
+    --body "${PR_BODY}" \
+    --head "${NEW_BRANCH}" \
+    --base "${TARGET_BRANCH}" 2>&1)"; then
+    echo "[ok] PR created: ${PR_URL}"
   else
-    echo "[warn] PR API creation failed (HTTP $HTTP_CODE)."
-    cat /tmp/create_pr_resp.json
+    echo "[warn] PR creation via gh failed: ${PR_URL}" >&2
   fi
 fi
